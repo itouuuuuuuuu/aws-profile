@@ -3,6 +3,7 @@
 /**
  * AWS Profile Switcher with MFA Support
  * Interactive profile selector with automatic AssumeRole functionality
+ * Supports direct role ARN assumption
  */
 
 const fs = require('fs');
@@ -22,7 +23,8 @@ const CONFIG = {
 
 const REGEX = {
   profile: /\[profile .*]/g,
-  bracketsRemoval: /(\[profile )|(\])/g
+  bracketsRemoval: /(\[profile )|(\])/g,
+  roleArn: /^arn:aws:iam::[0-9]{12}:role\/[a-zA-Z0-9+=,.@_\/-]+$/
 };
 
 const DEFAULTS = {
@@ -147,6 +149,43 @@ const getAwsConfig = (profile, key) => {
 };
 
 /**
+ * Check if input string is a valid Role ARN
+ * @param {string} input - Input string to check
+ * @returns {boolean} True if input is a valid Role ARN
+ */
+const isRoleArn = (input) => {
+  return REGEX.roleArn.test(input);
+};
+
+/**
+ * Get current AWS profile or default
+ * @returns {string} Current AWS profile name
+ */
+const getCurrentProfile = () => {
+  return process.env.AWS_PROFILE || process.env.AWS_DEFAULT_PROFILE || 'default';
+};
+
+/**
+ * Get MFA serial for a profile, try multiple possible locations
+ * @param {string} profile - AWS profile name
+ * @returns {string|null} MFA serial ARN or null if not found
+ */
+const getMfaSerial = (profile) => {
+  try {
+    // Try profile-specific MFA serial
+    return execSync(`aws configure get ${profile}.mfa_serial`, { encoding: 'utf8' }).trim();
+  } catch {
+    try {
+      // Try default profile MFA serial
+      return execSync(`aws configure get default.mfa_serial`, { encoding: 'utf8' }).trim();
+    } catch {
+      // No MFA serial found
+      return null;
+    }
+  }
+};
+
+/**
  * Copy credentials to clipboard
  * @param {Object} credentials - AWS credentials
  * @returns {boolean} Success status
@@ -161,6 +200,68 @@ AWS_SESSION_TOKEN=${credentials.sessionToken}`;
     execSync(`echo "${clipboardContent}" | pbcopy`);
     return true;
   } catch (error) {
+    return false;
+  }
+};
+
+/**
+ * Perform AWS STS AssumeRole with direct Role ARN
+ * @param {string} roleArn - Role ARN to assume
+ * @param {string} sourceProfile - Source profile to use for AssumeRole
+ * @param {string} mfaCode - MFA authentication code (optional)
+ * @returns {boolean} Success status
+ */
+const performAssumeRoleWithArn = (roleArn, sourceProfile, mfaCode = null) => {
+  try {
+    const sessionName = `awsp-${Date.now()}`;
+    let assumeRoleCommand = `aws sts assume-role --profile "${sourceProfile}" --role-arn "${roleArn}" --role-session-name "${sessionName}"`;
+    
+    // Add MFA if provided
+    if (mfaCode) {
+      const mfaSerial = getMfaSerial(sourceProfile);
+      if (mfaSerial) {
+        assumeRoleCommand += ` --serial-number "${mfaSerial}" --token-code "${mfaCode}"`;
+      } else {
+        console.error('MFA code provided but no MFA serial found for profile:', sourceProfile);
+        return false;
+      }
+    }
+    
+    const stsCredentials = execSync(assumeRoleCommand, { encoding: 'utf8' });
+    const credentials = JSON.parse(stsCredentials);
+    
+    // Extract credentials
+    const creds = {
+      accessKeyId: credentials.Credentials.AccessKeyId,
+      secretAccessKey: credentials.Credentials.SecretAccessKey,
+      sessionToken: credentials.Credentials.SessionToken
+    };
+    
+    // Extract role name from ARN for display
+    const roleName = roleArn.split('/').pop();
+    
+    // Create credentials content for shell export
+    const credentialsContent = `export AWS_ACCESS_KEY_ID=${creds.accessKeyId}
+export AWS_SECRET_ACCESS_KEY=${creds.secretAccessKey}
+export AWS_REGION=${CONFIG.awsRegion}
+export AWS_SESSION_TOKEN=${creds.sessionToken}
+export AWS_ASSUMED_ROLE_ARN=${roleArn}
+export AWS_ASSUMED_ROLE_NAME=${roleName}`;
+    
+    // Write to temporary file for shell processing
+    fs.writeFileSync(CONFIG.credentialsFile, credentialsContent);
+    
+    // Copy to clipboard and display result
+    const clipboardSuccess = copyToClipboard(creds);
+    const message = clipboardSuccess 
+      ? `Successfully assumed role: ${roleName}`
+      : `Successfully assumed role: ${roleName} (clipboard copy failed)`;
+    
+    console.log(message);
+    return true;
+    
+  } catch (error) {
+    console.error('Error assuming role:', error.message);
     return false;
   }
 };
@@ -220,7 +321,41 @@ export AWS_DEFAULT_PROFILE=${profile}`;
  */
 const main = async () => {
   try {
-    // Read AWS profiles and prompt for selection
+    // Check if Role ARN is provided as command line argument
+    const args = process.argv.slice(2);
+    const roleArnArg = args.find(arg => isRoleArn(arg));
+    
+    if (roleArnArg) {
+      // Direct Role ARN assumption mode
+      const sourceProfile = getCurrentProfile();
+      const mfaSerial = getMfaSerial(sourceProfile);
+      
+      if (mfaSerial) {
+        // MFA is required
+        try {
+          const mfaAnswer = await promptMfaCode();
+          const success = performAssumeRoleWithArn(roleArnArg, sourceProfile, mfaAnswer.mfaCode);
+          
+          if (!success) {
+            process.exit(1);
+          }
+        } catch (error) {
+          console.error('MFA authentication failed:', error.message);
+          process.exit(1);
+        }
+      } else {
+        // No MFA required
+        const success = performAssumeRoleWithArn(roleArnArg, sourceProfile);
+        
+        if (!success) {
+          process.exit(1);
+        }
+      }
+      
+      return;
+    }
+    
+    // Interactive profile selection mode
     const awsConfig = await readAwsProfiles();
     const profileAnswer = await promptProfileChoice(awsConfig);
     

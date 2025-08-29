@@ -64,14 +64,6 @@ AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
   else
     echo "Successfully assumed role (clipboard copy failed)"
   fi
-  
-  # Output environment variables for eval
-  echo "export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"
-  echo "export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
-  echo "export AWS_REGION=$AWS_REGION"
-  echo "export AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
-  echo "export AWS_PROFILE=$profile"
-  echo "export AWS_DEFAULT_PROFILE=$profile"
 }
 
 # Process credentials from temporary file
@@ -95,15 +87,88 @@ process_credentials_file() {
 # Check dependencies before proceeding
 check_dependencies
 
+# Function to check if input is a Role ARN
+is_role_arn() {
+  local input="$1"
+  if [[ $input =~ ^arn:aws:iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+$ ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Function to assume role with direct ARN
+assume_role_with_arn() {
+  local role_arn="$1"
+  local source_profile="$2"
+  local mfa_code="$3"
+  
+  local session_name="awsp-$(date +%s)"
+  local role_name="$(basename "$role_arn")"
+  
+  local assume_command="aws sts assume-role --profile \"$source_profile\" --role-arn \"$role_arn\" --role-session-name \"$session_name\""
+  
+  # Add MFA if provided
+  if [ -n "$mfa_code" ]; then
+    local mfa_serial=$(aws configure get $source_profile.mfa_serial 2>/dev/null || aws configure get default.mfa_serial 2>/dev/null)
+    if [ -n "$mfa_serial" ]; then
+      assume_command="$assume_command --serial-number \"$mfa_serial\" --token-code \"$mfa_code\""
+    else
+      echo "Error: MFA code provided but no MFA serial found for profile $source_profile" >&2
+      return 1
+    fi
+  fi
+  
+  # Execute STS AssumeRole
+  AWS_STS_CREDENTIALS=$(eval "$assume_command" 2>/dev/null)
+  
+  if [ $? -ne 0 ]; then
+    echo "Error: Failed to assume role $role_name. Check your credentials and try again." >&2
+    return 1
+  fi
+  
+  # Extract credentials from response
+  AWS_ACCESS_KEY_ID=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.AccessKeyId')
+  AWS_SECRET_ACCESS_KEY=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.SecretAccessKey')
+  AWS_SESSION_TOKEN=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.SessionToken')
+  
+  # Copy credentials to clipboard
+  clipboard_content="AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+AWS_REGION=$AWS_REGION
+AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
+  
+  echo "$clipboard_content" | pbcopy 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo "Successfully assumed role: $role_name (credentials copied to clipboard)"
+  else
+    echo "Successfully assumed role: $role_name (clipboard copy failed)"
+  fi
+}
+
 # Parse command line options
 mfa_code=""
-while getopts "m:" opt; do
+source_profile=""
+while getopts "m:p:" opt; do
   case $opt in
     m)
       mfa_code="$OPTARG"
       ;;
+    p)
+      source_profile="$OPTARG"
+      ;;
     \?)
-      echo "Usage: $0 [-m MFA_CODE] [PROFILE_NAME]" >&2
+      echo "Usage: $0 [-m MFA_CODE] [-p SOURCE_PROFILE] [PROFILE_NAME|ROLE_ARN]" >&2
+      echo "" >&2
+      echo "Options:" >&2
+      echo "  -m MFA_CODE        MFA authentication code" >&2
+      echo "  -p SOURCE_PROFILE  Source profile to use for AssumeRole (defaults to current AWS_PROFILE or default)" >&2
+      echo "" >&2
+      echo "Examples:" >&2
+      echo "  $0 my-profile                                          # Switch to profile" >&2
+      echo "  $0 arn:aws:iam::123456789012:role/MyRole              # Assume role with ARN" >&2
+      echo "  $0 -m 123456 arn:aws:iam::123456789012:role/MyRole    # Assume role with MFA" >&2
+      echo "  $0 -p source-profile arn:aws:iam::123456789012:role/MyRole  # Assume role with specific source profile" >&2
       exit 1
       ;;
   esac
@@ -111,18 +176,29 @@ done
 
 shift $((OPTIND-1))
 
-# Handle command line profile argument
+# Handle command line argument (profile name or role ARN)
 if [ $# -ge 1 ]; then
-  profile="$1"
+  argument="$1"
   
-  if [ -n "$mfa_code" ]; then
-    # MFA code provided: execute AssumeRole directly
-    assume_role_with_mfa "$profile" "$mfa_code"
+  # Check if argument is a Role ARN
+  if is_role_arn "$argument"; then
+    # Role ARN provided
+    if [ -z "$source_profile" ]; then
+      source_profile="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-default}}"
+    fi
+    
+    assume_role_with_arn "$argument" "$source_profile" "$mfa_code"
   else
-    # No MFA code: set profile conventionally
-    export AWS_PROFILE="$profile"
-    export AWS_DEFAULT_PROFILE="$profile"
-    echo "set profile: $AWS_PROFILE"
+    # Profile name provided
+    if [ -n "$mfa_code" ]; then
+      # MFA code provided: execute AssumeRole directly
+      assume_role_with_mfa "$argument" "$mfa_code"
+    else
+      # No MFA code: set profile conventionally
+      export AWS_PROFILE="$argument"
+      export AWS_DEFAULT_PROFILE="$argument"
+      echo "set profile: $AWS_PROFILE"
+    fi
   fi
 else
   # Interactive mode: run Node.js selector
