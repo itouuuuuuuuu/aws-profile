@@ -8,6 +8,7 @@ Easily switch between AWS Profiles with automatic MFA-enabled AssumeRole functio
 
 - 🔀 Interactive AWS profile switching
 - 🔐 Automatic MFA-enabled AssumeRole for configured profiles
+- 🎯 Direct Role ARN assumption without pre-configured profiles
 - 📋 Automatic clipboard copy of credentials
 - 🚀 Command-line interface with direct MFA code input
 - ⚡ Environment variable export for immediate use
@@ -77,10 +78,30 @@ awsp my-profile
 
 # Switch to profile with MFA code
 awsp -m 123456 my-role-profile
-
-# Use with eval for immediate environment variable setting
-eval $(awsp -m 123456 my-role-profile)
 ```
+
+### Direct Role ARN Assumption
+
+Assume roles directly by specifying a Role ARN without pre-configuring profiles:
+
+```sh
+# Assume role with automatic MFA prompt if needed
+awsp arn:aws:iam::123456789012:role/MyRole
+
+# Assume role with MFA code
+awsp -m 123456 arn:aws:iam::123456789012:role/MyRole
+
+# Specify source profile for AssumeRole operation
+awsp -p source-profile arn:aws:iam::123456789012:role/MyRole
+
+# Combine source profile and MFA code
+awsp -p source-profile -m 123456 arn:aws:iam::123456789012:role/MyRole
+```
+
+This feature is particularly useful for:
+- Temporary role assumptions without modifying AWS config files
+- Cross-account access with dynamically provided Role ARNs
+- CI/CD pipelines where Role ARNs are provided as variables
 
 ### Usage Examples
 
@@ -102,11 +123,20 @@ Successfully assumed role for profile: my-role-profile
 # Credentials automatically copied to clipboard
 ```
 
-**Direct Command Line:**
+**Direct Role ARN Assumption:**
 ```sh
-$ eval $(awsp -m 123456 my-role-profile)
-Credentials copied to clipboard
-# Environment variables are now set in current shell
+$ awsp arn:aws:iam::701918377831:role/cm-membersportal-billing
+AWS Profile Switcher
+? Enter MFA code: 123456
+Successfully assumed role: cm-membersportal-billing (credentials copied to clipboard)
+# Temporary credentials are set for the assumed role
+```
+
+**Direct Role ARN with MFA Code:**
+```sh
+$ awsp -m 123456 arn:aws:iam::701918377831:role/cm-membersportal-billing
+Successfully assumed role: cm-membersportal-billing (credentials copied to clipboard)
+# Credentials are automatically copied to clipboard for easy use
 ```
 
 ## MFA Configuration Details
