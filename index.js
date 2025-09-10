@@ -258,6 +258,24 @@ export AWS_ASSUMED_ROLE_NAME=${roleName}`;
       : `Successfully assumed role: ${roleName} (clipboard copy failed)`;
     
     console.log(message);
+    
+    // Display current AWS identity for confirmation
+    try {
+      console.log('\nCurrent AWS identity:');
+      const callerIdentity = execSync('aws sts get-caller-identity --output table 2>/dev/null', { 
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          AWS_ACCESS_KEY_ID: creds.accessKeyId,
+          AWS_SECRET_ACCESS_KEY: creds.secretAccessKey,
+          AWS_SESSION_TOKEN: creds.sessionToken
+        }
+      });
+      console.log(callerIdentity);
+    } catch (error) {
+      // Silently ignore errors to avoid disrupting the main flow
+    }
+    
     return true;
     
   } catch (error) {
@@ -308,6 +326,24 @@ export AWS_DEFAULT_PROFILE=${profile}`;
       : `Successfully assumed role for profile: ${profile} (clipboard copy failed)`;
     
     console.log(message);
+    
+    // Display current AWS identity for confirmation
+    try {
+      console.log('\nCurrent AWS identity:');
+      const callerIdentity = execSync('aws sts get-caller-identity --output table 2>/dev/null', { 
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          AWS_ACCESS_KEY_ID: creds.accessKeyId,
+          AWS_SECRET_ACCESS_KEY: creds.secretAccessKey,
+          AWS_SESSION_TOKEN: creds.sessionToken
+        }
+      });
+      console.log(callerIdentity);
+    } catch (error) {
+      // Silently ignore errors to avoid disrupting the main flow
+    }
+    
     return true;
     
   } catch (error) {
