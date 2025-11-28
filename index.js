@@ -32,6 +32,102 @@ const DEFAULTS = {
   mfaCodeLength: 6
 };
 
+const OP_ITEM_NAME = 'awsp';
+const LAST_TOTP_FILE = `${process.env['HOME']}/.awsp-last-totp`;
+
+/**
+ * Get last used TOTP from file
+ * @returns {string|null} Last used TOTP or null
+ */
+const getLastUsedTotp = () => {
+  try {
+    return fs.readFileSync(LAST_TOTP_FILE, 'utf8').trim();
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Save last used TOTP to file
+ * @param {string} totp - TOTP code to save
+ */
+const saveLastUsedTotp = (totp) => {
+  try {
+    fs.writeFileSync(LAST_TOTP_FILE, totp);
+  } catch {
+    // Ignore errors
+  }
+};
+
+/**
+ * Get credentials from 1Password (fetches all fields in one call)
+ * @returns {Object|null} Credentials object or null if failed
+ */
+const getCredentialsFrom1Password = () => {
+  try {
+    const result = execSync(
+      `op item get ${OP_ITEM_NAME} --fields aws_access_key_id,aws_secret_access_key,mfa_serial --reveal --format json`,
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    const fields = JSON.parse(result);
+    const getValue = (label) => fields.find(f => f.label === label)?.value || null;
+
+    const accessKeyId = getValue('aws_access_key_id');
+    const secretAccessKey = getValue('aws_secret_access_key');
+    const mfaSerial = getValue('mfa_serial');
+
+    if (!accessKeyId || !secretAccessKey) {
+      return null;
+    }
+
+    return { accessKeyId, secretAccessKey, mfaSerial };
+  } catch (error) {
+    return null;
+  }
+};
+
+/**
+ * Get TOTP code from 1Password
+ * @returns {string|null} TOTP code or null if failed
+ */
+const getTotpFrom1Password = () => {
+  try {
+    const result = execSync(`op item get ${OP_ITEM_NAME} --otp`, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe']
+    }).trim();
+    return result || null;
+  } catch (error) {
+    return null;
+  }
+};
+
+/**
+ * Get credentials with 1Password priority and fallback
+ * @param {string} profile - AWS profile name for fallback
+ * @returns {Object} Credentials object with source indicator
+ */
+const getCredentials = (profile) => {
+  // Try 1Password first
+  const opCredentials = getCredentialsFrom1Password();
+  if (opCredentials) {
+    console.log('Using credentials from 1Password');
+    return {
+      ...opCredentials,
+      source: '1password'
+    };
+  }
+
+  // Fallback to AWS CLI/credentials file
+  console.log('Falling back to ~/.aws/credentials');
+  return {
+    accessKeyId: null,
+    secretAccessKey: null,
+    mfaSerial: null,
+    source: 'aws-cli'
+  };
+};
+
 /**
  * Display profile selection prompt
  * @param {string} data - AWS config file content
@@ -124,15 +220,64 @@ const promptMfaCode = () => {
 };
 
 /**
+ * Sleep for specified milliseconds
+ * @param {number} ms - Milliseconds to sleep
+ * @returns {Promise<void>}
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Get MFA code (1Password TOTP priority, fallback to manual input)
+ * @returns {Promise<string>} MFA code
+ */
+const getMfaCode = async () => {
+  // Try 1Password TOTP first
+  let totp = getTotpFrom1Password();
+  const lastUsedTotp = getLastUsedTotp();
+
+  if (totp) {
+    // Check if this TOTP was already used (same code means same 30-second window)
+    if (totp === lastUsedTotp) {
+      console.log('TOTP code was already used. Waiting for next code (up to 30 seconds)...');
+      // Wait up to 30 seconds for a new code
+      for (let i = 0; i < 30; i++) {
+        process.stdout.write(`\rWaiting for new TOTP code... ${30 - i}s remaining`);
+        await sleep(1000);
+        const newTotp = getTotpFrom1Password();
+        if (newTotp && newTotp !== lastUsedTotp) {
+          totp = newTotp;
+          console.log('\rNew TOTP code received.                              ');
+          break;
+        }
+      }
+
+      // If still the same, fall back to manual input
+      if (totp === lastUsedTotp) {
+        console.log('TOTP timeout, falling back to manual input');
+        const answer = await promptMfaCode();
+        return answer.mfaCode;
+      }
+    }
+
+    console.log('Using TOTP from 1Password');
+    saveLastUsedTotp(totp);
+    return totp;
+  }
+
+  // Fallback to manual input
+  const answer = await promptMfaCode();
+  return answer.mfaCode;
+};
+
+/**
  * Check if profile has role configuration for AssumeRole
  * @param {string} profile - AWS profile name
- * @returns {boolean} True if profile has role_arn and mfa_serial configured
+ * @returns {boolean} True if profile has role_arn configured
  */
 const hasRoleConfiguration = (profile) => {
   try {
     const roleArn = execSync(`aws configure get ${profile}.role_arn`, { encoding: 'utf8' }).trim();
-    const mfaSerial = execSync(`aws configure get ${profile}.mfa_serial`, { encoding: 'utf8' }).trim();
-    return roleArn && mfaSerial;
+    return !!roleArn;
   } catch (error) {
     return false;
   }
@@ -166,11 +311,18 @@ const getCurrentProfile = () => {
 };
 
 /**
- * Get MFA serial for a profile, try multiple possible locations
+ * Get MFA serial for a profile, try 1Password first then AWS config
  * @param {string} profile - AWS profile name
  * @returns {string|null} MFA serial ARN or null if not found
  */
 const getMfaSerial = (profile) => {
+  // Try 1Password first
+  const opCredentials = getCredentialsFrom1Password();
+  if (opCredentials && opCredentials.mfaSerial) {
+    return opCredentials.mfaSerial;
+  }
+
+  // Fallback to AWS config
   try {
     // Try profile-specific MFA serial
     return execSync(`aws configure get ${profile}.mfa_serial`, { encoding: 'utf8' }).trim();
@@ -213,12 +365,15 @@ AWS_SESSION_TOKEN=${credentials.sessionToken}`;
  */
 const performAssumeRoleWithArn = (roleArn, sourceProfile, mfaCode = null) => {
   try {
+    // Get credentials (1Password priority with fallback)
+    const baseCreds = getCredentials(sourceProfile);
+
     const sessionName = `awsp-${Date.now()}`;
-    let assumeRoleCommand = `aws sts assume-role --profile "${sourceProfile}" --role-arn "${roleArn}" --role-session-name "${sessionName}"`;
-    
+    let assumeRoleCommand = `aws sts assume-role --role-arn "${roleArn}" --role-session-name "${sessionName}"`;
+
     // Add MFA if provided
     if (mfaCode) {
-      const mfaSerial = getMfaSerial(sourceProfile);
+      const mfaSerial = baseCreds.mfaSerial || getMfaSerial(sourceProfile);
       if (mfaSerial) {
         assumeRoleCommand += ` --serial-number "${mfaSerial}" --token-code "${mfaCode}"`;
       } else {
@@ -226,8 +381,34 @@ const performAssumeRoleWithArn = (roleArn, sourceProfile, mfaCode = null) => {
         return false;
       }
     }
-    
-    const stsCredentials = execSync(assumeRoleCommand, { encoding: 'utf8' });
+
+    // Execute with appropriate credentials
+    let execOptions = { encoding: 'utf8' };
+    if (baseCreds.source === '1password') {
+      // Remove existing AWS credentials from env to avoid conflicts
+      const cleanEnv = { ...process.env };
+      delete cleanEnv.AWS_ACCESS_KEY_ID;
+      delete cleanEnv.AWS_SECRET_ACCESS_KEY;
+      delete cleanEnv.AWS_SESSION_TOKEN;
+      delete cleanEnv.AWS_SECURITY_TOKEN;
+
+      execOptions.env = {
+        ...cleanEnv,
+        AWS_ACCESS_KEY_ID: baseCreds.accessKeyId,
+        AWS_SECRET_ACCESS_KEY: baseCreds.secretAccessKey
+      };
+    } else {
+      // Fallback: use profile
+      assumeRoleCommand = `aws sts assume-role --profile "${sourceProfile}" --role-arn "${roleArn}" --role-session-name "${sessionName}"`;
+      if (mfaCode) {
+        const mfaSerial = getMfaSerial(sourceProfile);
+        if (mfaSerial) {
+          assumeRoleCommand += ` --serial-number "${mfaSerial}" --token-code "${mfaCode}"`;
+        }
+      }
+    }
+
+    const stsCredentials = execSync(assumeRoleCommand, execOptions);
     const credentials = JSON.parse(stsCredentials);
     
     // Extract credentials
@@ -292,13 +473,39 @@ export AWS_ASSUMED_ROLE_NAME=${roleName}`;
  */
 const performAssumeRole = (profile, mfaCode) => {
   try {
-    // Get role configuration
+    // Get credentials (1Password priority with fallback)
+    const baseCreds = getCredentials(profile);
+
+    // Get role configuration from AWS config
     const roleArn = getAwsConfig(profile, 'role_arn');
-    const mfaSerial = getAwsConfig(profile, 'mfa_serial');
-    
-    // Execute AssumeRole
-    const assumeRoleCommand = `aws sts assume-role --profile default --role-arn "${roleArn}" --role-session-name "${profile}-session" --serial-number "${mfaSerial}" --token-code "${mfaCode}"`;
-    const stsCredentials = execSync(assumeRoleCommand, { encoding: 'utf8' });
+    // Use 1Password mfa_serial if available, otherwise from AWS config
+    const mfaSerial = baseCreds.mfaSerial || getAwsConfig(profile, 'mfa_serial');
+
+    // Build command and execute
+    let assumeRoleCommand;
+    let execOptions = { encoding: 'utf8' };
+
+    if (baseCreds.source === '1password') {
+      // Use 1Password credentials via environment variables
+      // Remove existing AWS credentials from env to avoid conflicts
+      const cleanEnv = { ...process.env };
+      delete cleanEnv.AWS_ACCESS_KEY_ID;
+      delete cleanEnv.AWS_SECRET_ACCESS_KEY;
+      delete cleanEnv.AWS_SESSION_TOKEN;
+      delete cleanEnv.AWS_SECURITY_TOKEN;
+
+      assumeRoleCommand = `aws sts assume-role --role-arn "${roleArn}" --role-session-name "${profile}-session" --serial-number "${mfaSerial}" --token-code "${mfaCode}"`;
+      execOptions.env = {
+        ...cleanEnv,
+        AWS_ACCESS_KEY_ID: baseCreds.accessKeyId,
+        AWS_SECRET_ACCESS_KEY: baseCreds.secretAccessKey
+      };
+    } else {
+      // Fallback: use profile
+      assumeRoleCommand = `aws sts assume-role --profile default --role-arn "${roleArn}" --role-session-name "${profile}-session" --serial-number "${mfaSerial}" --token-code "${mfaCode}"`;
+    }
+
+    const stsCredentials = execSync(assumeRoleCommand, execOptions);
     const credentials = JSON.parse(stsCredentials);
     
     // Extract credentials
@@ -369,9 +576,9 @@ const main = async () => {
       if (mfaSerial) {
         // MFA is required
         try {
-          const mfaAnswer = await promptMfaCode();
-          const success = performAssumeRoleWithArn(roleArnArg, sourceProfile, mfaAnswer.mfaCode);
-          
+          const mfaCode = await getMfaCode();
+          const success = performAssumeRoleWithArn(roleArnArg, sourceProfile, mfaCode);
+
           if (!success) {
             process.exit(1);
           }
@@ -405,9 +612,9 @@ const main = async () => {
     // Check if profile requires MFA authentication
     if (hasRoleConfiguration(profileChoice)) {
       try {
-        const mfaAnswer = await promptMfaCode();
-        const success = performAssumeRole(profileChoice, mfaAnswer.mfaCode);
-        
+        const mfaCode = await getMfaCode();
+        const success = performAssumeRole(profileChoice, mfaCode);
+
         if (!success) {
           process.exit(1);
         }
