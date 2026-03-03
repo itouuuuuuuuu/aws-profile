@@ -361,9 +361,10 @@ AWS_SESSION_TOKEN=${credentials.sessionToken}`;
  * @param {string} roleArn - Role ARN to assume
  * @param {string} sourceProfile - Source profile to use for AssumeRole
  * @param {string} mfaCode - MFA authentication code (optional)
+ * @param {boolean} shouldCopy - Whether to copy credentials to clipboard
  * @returns {boolean} Success status
  */
-const performAssumeRoleWithArn = (roleArn, sourceProfile, mfaCode = null) => {
+const performAssumeRoleWithArn = (roleArn, sourceProfile, mfaCode = null, shouldCopy = false) => {
   try {
     // Get credentials (1Password priority with fallback)
     const baseCreds = getCredentials(sourceProfile);
@@ -433,17 +434,20 @@ export AWS_ASSUMED_ROLE_NAME=${roleName}`;
     fs.writeFileSync(CONFIG.credentialsFile, credentialsContent);
     
     // Copy to clipboard and display result
-    const clipboardSuccess = copyToClipboard(creds);
-    const message = clipboardSuccess 
-      ? `Successfully assumed role: ${roleName}`
-      : `Successfully assumed role: ${roleName} (clipboard copy failed)`;
-    
-    console.log(message);
-    
+    if (shouldCopy) {
+      const clipboardSuccess = copyToClipboard(creds);
+      const message = clipboardSuccess
+        ? `Successfully assumed role: ${roleName} (credentials copied to clipboard)`
+        : `Successfully assumed role: ${roleName} (clipboard copy failed)`;
+      console.log(message);
+    } else {
+      console.log(`Successfully assumed role: ${roleName}`);
+    }
+
     // Display current AWS identity for confirmation
     try {
       console.log('\nCurrent AWS identity:');
-      const callerIdentity = execSync('aws sts get-caller-identity --output table 2>/dev/null', { 
+      const callerIdentity = execSync('aws sts get-caller-identity --output table 2>/dev/null', {
         encoding: 'utf8',
         env: {
           ...process.env,
@@ -456,9 +460,9 @@ export AWS_ASSUMED_ROLE_NAME=${roleName}`;
     } catch (error) {
       // Silently ignore errors to avoid disrupting the main flow
     }
-    
+
     return true;
-    
+
   } catch (error) {
     console.error('Error assuming role:', error.message);
     return false;
@@ -469,9 +473,10 @@ export AWS_ASSUMED_ROLE_NAME=${roleName}`;
  * Perform AWS STS AssumeRole with MFA
  * @param {string} profile - AWS profile name
  * @param {string} mfaCode - MFA authentication code
+ * @param {boolean} shouldCopy - Whether to copy credentials to clipboard
  * @returns {boolean} Success status
  */
-const performAssumeRole = (profile, mfaCode) => {
+const performAssumeRole = (profile, mfaCode, shouldCopy = false) => {
   try {
     // Get credentials (1Password priority with fallback)
     const baseCreds = getCredentials(profile);
@@ -527,12 +532,15 @@ export AWS_DEFAULT_PROFILE=${profile}`;
     fs.writeFileSync(CONFIG.credentialsFile, credentialsContent);
     
     // Copy to clipboard and display result
-    const clipboardSuccess = copyToClipboard(creds);
-    const message = clipboardSuccess 
-      ? `Successfully assumed role for profile: ${profile}`
-      : `Successfully assumed role for profile: ${profile} (clipboard copy failed)`;
-    
-    console.log(message);
+    if (shouldCopy) {
+      const clipboardSuccess = copyToClipboard(creds);
+      const message = clipboardSuccess
+        ? `Successfully assumed role for profile: ${profile} (credentials copied to clipboard)`
+        : `Successfully assumed role for profile: ${profile} (clipboard copy failed)`;
+      console.log(message);
+    } else {
+      console.log(`Successfully assumed role for profile: ${profile}`);
+    }
     
     // Display current AWS identity for confirmation
     try {
@@ -564,8 +572,9 @@ export AWS_DEFAULT_PROFILE=${profile}`;
  */
 const main = async () => {
   try {
-    // Check if Role ARN is provided as command line argument
+    // Parse command line arguments
     const args = process.argv.slice(2);
+    const shouldCopyToClipboard = args.includes('-c');
     const roleArnArg = args.find(arg => isRoleArn(arg));
     
     if (roleArnArg) {
@@ -577,7 +586,7 @@ const main = async () => {
         // MFA is required
         try {
           const mfaCode = await getMfaCode();
-          const success = performAssumeRoleWithArn(roleArnArg, sourceProfile, mfaCode);
+          const success = performAssumeRoleWithArn(roleArnArg, sourceProfile, mfaCode, shouldCopyToClipboard);
 
           if (!success) {
             process.exit(1);
@@ -588,8 +597,8 @@ const main = async () => {
         }
       } else {
         // No MFA required
-        const success = performAssumeRoleWithArn(roleArnArg, sourceProfile);
-        
+        const success = performAssumeRoleWithArn(roleArnArg, sourceProfile, null, shouldCopyToClipboard);
+
         if (!success) {
           process.exit(1);
         }
@@ -613,7 +622,7 @@ const main = async () => {
     if (hasRoleConfiguration(profileChoice)) {
       try {
         const mfaCode = await getMfaCode();
-        const success = performAssumeRole(profileChoice, mfaCode);
+        const success = performAssumeRole(profileChoice, mfaCode, shouldCopyToClipboard);
 
         if (!success) {
           process.exit(1);
