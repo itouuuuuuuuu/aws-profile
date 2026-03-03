@@ -24,6 +24,7 @@ check_dependencies() {
 assume_role_with_mfa() {
   local profile=$1
   local mfa_code=$2
+  local copy_flag=$3
   
   # Get required configuration from AWS config
   local role_arn=$(aws configure get $profile.role_arn 2>/dev/null)
@@ -52,17 +53,21 @@ assume_role_with_mfa() {
   AWS_SECRET_ACCESS_KEY=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.SecretAccessKey')
   AWS_SESSION_TOKEN=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.SessionToken')
   
-  # Copy credentials to clipboard
-  clipboard_content="AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+  # Copy credentials to clipboard (only with -c flag)
+  if [ "$copy_flag" = "true" ]; then
+    clipboard_content="AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
 AWS_REGION=$AWS_REGION
 AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
-  
-  echo "$clipboard_content" | pbcopy 2>/dev/null
-  if [ $? -eq 0 ]; then
-    echo "Credentials copied to clipboard"
+
+    echo "$clipboard_content" | pbcopy 2>/dev/null
+    if [ $? -eq 0 ]; then
+      echo "Credentials copied to clipboard"
+    else
+      echo "Successfully assumed role (clipboard copy failed)"
+    fi
   else
-    echo "Successfully assumed role (clipboard copy failed)"
+    echo "Successfully assumed role"
   fi
 }
 
@@ -102,6 +107,7 @@ assume_role_with_arn() {
   local role_arn="$1"
   local source_profile="$2"
   local mfa_code="$3"
+  local copy_flag="$4"
   
   local session_name="awsp-$(date +%s)"
   local role_name="$(basename "$role_arn")"
@@ -132,25 +138,33 @@ assume_role_with_arn() {
   AWS_SECRET_ACCESS_KEY=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.SecretAccessKey')
   AWS_SESSION_TOKEN=$(echo "$AWS_STS_CREDENTIALS" | jq -r '.Credentials.SessionToken')
   
-  # Copy credentials to clipboard
-  clipboard_content="AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+  # Copy credentials to clipboard (only with -c flag)
+  if [ "$copy_flag" = "true" ]; then
+    clipboard_content="AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
 AWS_REGION=$AWS_REGION
 AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
-  
-  echo "$clipboard_content" | pbcopy 2>/dev/null
-  if [ $? -eq 0 ]; then
-    echo "Successfully assumed role: $role_name (credentials copied to clipboard)"
+
+    echo "$clipboard_content" | pbcopy 2>/dev/null
+    if [ $? -eq 0 ]; then
+      echo "Successfully assumed role: $role_name (credentials copied to clipboard)"
+    else
+      echo "Successfully assumed role: $role_name (clipboard copy failed)"
+    fi
   else
-    echo "Successfully assumed role: $role_name (clipboard copy failed)"
+    echo "Successfully assumed role: $role_name"
   fi
 }
 
 # Parse command line options
 mfa_code=""
 source_profile=""
-while getopts "m:p:" opt; do
+copy_to_clipboard=""
+while getopts "cm:p:" opt; do
   case $opt in
+    c)
+      copy_to_clipboard="true"
+      ;;
     m)
       mfa_code="$OPTARG"
       ;;
@@ -158,16 +172,17 @@ while getopts "m:p:" opt; do
       source_profile="$OPTARG"
       ;;
     \?)
-      echo "Usage: $0 [-m MFA_CODE] [-p SOURCE_PROFILE] [PROFILE_NAME|ROLE_ARN]" >&2
+      echo "Usage: $0 [-c] [-m MFA_CODE] [-p SOURCE_PROFILE] [PROFILE_NAME|ROLE_ARN]" >&2
       echo "" >&2
       echo "Options:" >&2
+      echo "  -c                 Copy credentials to clipboard after assuming role" >&2
       echo "  -m MFA_CODE        MFA authentication code" >&2
       echo "  -p SOURCE_PROFILE  Source profile to use for AssumeRole (defaults to current AWS_PROFILE or default)" >&2
       echo "" >&2
       echo "Examples:" >&2
       echo "  $0 my-profile                                          # Switch to profile" >&2
-      echo "  $0 arn:aws:iam::123456789012:role/MyRole              # Assume role with ARN" >&2
-      echo "  $0 -m 123456 arn:aws:iam::123456789012:role/MyRole    # Assume role with MFA" >&2
+      echo "  $0 -c arn:aws:iam::123456789012:role/MyRole           # Assume role with ARN and copy to clipboard" >&2
+      echo "  $0 -c -m 123456 arn:aws:iam::123456789012:role/MyRole # Assume role with MFA and copy to clipboard" >&2
       echo "  $0 -p source-profile arn:aws:iam::123456789012:role/MyRole  # Assume role with specific source profile" >&2
       exit 1
       ;;
@@ -187,12 +202,12 @@ if [ $# -ge 1 ]; then
       source_profile="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-default}}"
     fi
     
-    assume_role_with_arn "$argument" "$source_profile" "$mfa_code"
+    assume_role_with_arn "$argument" "$source_profile" "$mfa_code" "$copy_to_clipboard"
   else
     # Profile name provided
     if [ -n "$mfa_code" ]; then
       # MFA code provided: execute AssumeRole directly
-      assume_role_with_mfa "$argument" "$mfa_code"
+      assume_role_with_mfa "$argument" "$mfa_code" "$copy_to_clipboard"
     else
       # No MFA code: set profile conventionally
       export AWS_PROFILE="$argument"
@@ -203,7 +218,11 @@ if [ $# -ge 1 ]; then
 else
   # Interactive mode: run Node.js selector
   CURRENT=$(cd $(dirname $0);pwd)
-  "$CURRENT/index.js"
+  if [ "$copy_to_clipboard" = "true" ]; then
+    "$CURRENT/index.js" -c
+  else
+    "$CURRENT/index.js"
+  fi
 
   selected_profile="$(cat ~/.awsp 2>/dev/null)"
   
